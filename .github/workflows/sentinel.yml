@@ -1,0 +1,114 @@
+name: sentinel
+
+# Osservatore esterno per l'homelab: legge un "battito di vita" pubblicato via DNS TXT dal server
+# di casa (aggiornato ogni 5 min). Se il battito invecchia oltre STALE_MIN la casa e' offline
+# (blackout, router o linea): avvisa su Telegram una volta all'inizio e una al ritorno.
+# Il nome del record e i dati Telegram sono segreti del repository.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      test_message:
+        description: "Invia un messaggio di prova su Telegram"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sentinel
+  cancel-in-progress: false
+
+env:
+  STALE_MIN: "20"
+  TZ: Europe/Rome
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ripristina stato precedente
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: sentinel-state-${{ github.run_id }}
+          restore-keys: sentinel-state-
+
+      - name: Controlla battito
+        env:
+          HB_NAME: ${{ secrets.HB_NAME }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          TEST_MESSAGE: ${{ inputs.test_message }}
+        run: |
+          set -u
+          mkdir -p state
+          tg() {
+            curl -fsS --max-time 15 -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+              -d "chat_id=${TG_CHAT_ID}" --data-urlencode "text=$1" >/dev/null
+          }
+          hm() { date -d "@$1" '+%d/%m %H:%M'; }
+
+          if [ "${TEST_MESSAGE:-false}" = "true" ]; then
+            tg "🧪 Sentinella esterna (GitHub Actions): messaggio di prova, configurazione OK."
+          fi
+
+          # due resolver pubblici indipendenti: si prende il battito piu' recente
+          ALIVE=0
+          for url in "https://dns.google/resolve?name=${HB_NAME}&type=TXT" \
+                     "https://cloudflare-dns.com/dns-query?name=${HB_NAME}&type=TXT"; do
+            v=$(curl -fsS --max-time 10 -H 'accept: application/dns-json' "$url" \
+                | grep -oE 'alive=[0-9]+' | head -1 | cut -d= -f2) || true
+            [ -n "${v:-}" ] && [ "$v" -gt "$ALIVE" ] && ALIVE=$v
+          done
+          PREV=$(cat state/status 2>/dev/null || echo ONLINE)
+          NOW=$(date +%s)
+
+          if [ "$ALIVE" -eq 0 ]; then
+            echo "Battito non leggibile dal DNS"
+            if [ "$PREV" != DNS_ERR ] && [ "$PREV" != OFFLINE ]; then
+              tg "🟡 Sentinella esterna: non riesco a leggere il battito dal DNS (record mancante o resolver in errore). Controllo di nuovo tra 10 minuti."
+              echo DNS_ERR > state/status
+            fi
+            exit 0
+          fi
+
+          AGE_MIN=$(( (NOW - ALIVE) / 60 ))
+          echo "Ultimo battito: $(hm "$ALIVE") ($AGE_MIN min fa), stato precedente: $PREV"
+          if [ "$AGE_MIN" -gt "$STALE_MIN" ]; then
+            if [ "$PREV" != OFFLINE ]; then
+              tg "🔴 CASA OFFLINE: nessun segnale dal server dalle $(hm "$ALIVE") (${AGE_MIN} min). Possibile blackout, router o linea 5G giu'. Il dettaglio arrivera' dalla sentinella di casa al ritorno della rete." \
+                && { echo OFFLINE > state/status; echo "$ALIVE" > state/since; }
+            fi
+          else
+            if [ "$PREV" = OFFLINE ]; then
+              SINCE=$(cat state/since 2>/dev/null || echo "$ALIVE")
+              tg "✅ CASA DI NUOVO ONLINE (ultimo segnale prima dell'interruzione: $(hm "$SINCE"))." \
+                && echo ONLINE > state/status
+            else
+              echo ONLINE > state/status
+            fi
+          fi
+
+      - name: Salva stato
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: sentinel-state-${{ github.run_id }}
+
+      - name: Mantieni attivo il repository (GitHub sospende i cron dopo 60 giorni senza attivita')
+        run: |
+          LAST=$(git log -1 --format=%ct)
+          if [ $(( $(date +%s) - LAST )) -gt $(( 30 * 86400 )) ]; then
+            date -u +%FT%TZ > keepalive.txt
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add keepalive.txt && git commit -m "keepalive" && git push
+          fi
