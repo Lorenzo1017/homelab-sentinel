@@ -7,7 +7,8 @@ name: sentinel
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    # minuti sfasati: gli orari tondi (:00, :10) sono i piu' ritardati da GitHub
+    - cron: "3-59/10 * * * *"
   workflow_dispatch:
     inputs:
       test_message:
